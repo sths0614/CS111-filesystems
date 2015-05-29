@@ -495,9 +495,11 @@ ospfs_dir_readdir(struct file *filp, void *dirent, filldir_t filldir)
 					break;
 				default:
 					eprintk("Error in dir_readdir");
+					r=1;
+					continue;
 			}
-			if(ok_so_far < 0)
-				return 0;
+			// if(ok_so_far < 0)
+			// 	return 0;
 		}
 		f_pos++;
 	}
