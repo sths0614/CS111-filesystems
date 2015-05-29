@@ -496,6 +496,8 @@ ospfs_dir_readdir(struct file *filp, void *dirent, filldir_t filldir)
 				default:
 					eprintk("Error in dir_readdir");
 			}
+			if(ok_so_far < 0)
+				return 0;
 		}
 		f_pos++;
 	}
@@ -543,6 +545,11 @@ ospfs_unlink(struct inode *dirino, struct dentry *dentry)
 
 	od->od_ino = 0;
 	oi->oi_nlink--;
+
+	//symbolic links
+	if(oi->oi_ftype != OSPFS_FTYPE_SYMLINK && oi->oi_nlink == 0)
+		change_size(oi,0);
+
 	return 0;
 }
 
@@ -575,6 +582,16 @@ static uint32_t
 allocate_block(void)
 {
 	/* EXERCISE: Your code here */
+	void *bitmap = ospfs_block(OSPFS_FREEMAP_BLK);
+
+	//check for free blocks. 0-2 blocks are always reserved so start at 3.
+	int i;
+	for(i = OSPFS_FREEMAP_BLK+1; i < ospfs_super->os_nblocks; i++){
+			if(bitvector_test(bitmap, i) == 1){
+				bitvector_clear(bitmap, i);
+				return i;					
+			}
+	}
 	return 0;
 }
 
@@ -594,6 +611,11 @@ static void
 free_block(uint32_t blockno)
 {
 	/* EXERCISE: Your code here */
+	int first_inode_block = ospfs_super->os_firstinob;
+	void *bitmap = ospfs_block(OSPFS_FREEMAP_BLK);
+	if(blockno > first_inode_block && blockno < OSPFS_MAXFILEBLKS){
+		bitvector_set(bitmap, blockno);
+	}
 }
 
 
@@ -630,7 +652,10 @@ static int32_t
 indir2_index(uint32_t b)
 {
 	// Your code here.
-	return -1;
+	if (b >= OSPFS_NDIRECT + OSPFS_NINDIRECT)
+		return 0;
+	else
+		return -1;
 }
 
 
@@ -648,8 +673,12 @@ indir2_index(uint32_t b)
 static int32_t
 indir_index(uint32_t b)
 {
-	// Your code here.
-	return -1;
+	if (b < OSPFS_NDIRECT)
+		return -1;
+	else if (b < OSPFS_NDIRECT + OSPFS_NINDIRECT)
+		return 0;
+	else 
+		return (b - OSPFS_NDIRECT - OSPFS_NINDIRECT)/OSPFS_NINDIRECT;
 }
 
 
@@ -665,8 +694,12 @@ indir_index(uint32_t b)
 static int32_t
 direct_index(uint32_t b)
 {
-	// Your code here.
-	return -1;
+	if (b < OSPFS_NDIRECT)
+		return b;
+	else if (b < OSPFS_NDIRECT + OSPFS_NINDIRECT)
+		return b - OSPFS_NDIRECT;
+	else 
+		return (b - OSPFS_NDIRECT) % OSPFS_NINDIRECT;
 }
 
 
@@ -711,8 +744,92 @@ add_block(ospfs_inode_t *oi)
 	uint32_t *allocated[2] = { 0, 0 };
 
 	/* EXERCISE: Your code here */
-	return -EIO; // Replace this line
+
+	int block = allocate_block();
+	if (block == 0){
+		return -ENOSPC;
+	}
+
+	if (n < 0)
+		return -EIO;
+	else if (n < OSPFS_NDIRECT){ //less than 10
+		int block = allocate_block();
+		if (block == 0){
+			return -ENOSPC;
+		}
+		memset(ospfs_block(block), 0, OSPFS_BLKSIZE);
+		oi->oi_direct[n] = block;
+	}
+	else if (n < OSPFS_NDIRECT + OSPFS_NINDIRECT){ //between 10 and 256
+		if (oi->oi_indirect == 0){ //n == 10, need to go to next level
+			allocated[0] = allocate_block();
+			if (allocated[0] == 0)
+				return -ENOSPC;
+			memset(ospfs_block(allocated[0]), 0, OSPFS_BLKSIZE);
+			oi->oi_indirect = allocated[0];
+		}
+		int block = allocate_block();
+		if (block == 0){
+			if (allocated[0]){
+				free_block(allocated[0]);
+				oi->oi_indirect = 0;
+			}
+			return -ENOSPC;
+		}
+		memset(ospfs_block(block), 0, OSPFS_BLKSIZE);
+		uint32_t *indir_ptr = ospfs_block(oi->oi_indirect);
+		indir_ptr[direct_index(n)] = block;	
+	}
+	else if (n < OSPFS_MAXFILEBLKS){ //more than 266
+		if (oi->oi_indirect2 == 0){ //n == 266, need to go to next level 
+			allocated[1] = allocate_block();
+			if (allocated[1] == 0)
+				return -ENOSPC;
+			memset(ospfs_block(allocated[1]), 0, OSPFS_BLKSIZE);
+			oi->oi_indirect2 = allocated[1];
+		}
+		uint32_t *indir2_ptr = ospfs_block(oi->oi_indirect2);
+		uint32_t indir = indir2_ptr[indir_index(n)];
+		if (indir == 0){ //need to go to next indir_blk
+			allocated[0] = allocate_block();
+			if (allocated[0] == 0){
+				if (allocated[1]){
+					free_block(allocated[1]);
+				}
+				return -ENOSPC;
+			}
+			memset(ospfs_block(allocated[0]), 0, OSPFS_BLKSIZE);
+			indir = allocated[0];
+		}
+
+		block = allocate_block();
+		if (block == 0){
+			if (allocated[1]){
+				free_block(allocated[1]);
+				oi->oi_indirect2 = 0;
+				return -ENOSPC;
+			}
+			if (allocated[0]){
+				free_block(allocated[0]);
+				return -ENOSPC;
+			}
+		}
+		memset(ospfs_block(block), 0, OSPFS_BLKSIZE);
+
+		uint32_t *indir_ptr = ospfs_block(indir);
+		indir_ptr[direct_index(n)] = block;
+	}
+	else{
+		return -ENOSPC;
+	}
+	oi->oi_size += OSPFS_BLKSIZE;
+	return 0;
 }
+
+	
+
+
+
 
 
 // remove_block(ospfs_inode_t *oi)
@@ -744,7 +861,51 @@ remove_block(ospfs_inode_t *oi)
 	uint32_t n = ospfs_size2nblocks(oi->oi_size);
 
 	/* EXERCISE: Your code here */
-	return -EIO; // Replace this line
+	if (n < 0)
+		return -EIO;
+	else if (n == 0)
+		return 0;
+
+	//subtracting one
+	n = n-1;
+
+	if (n < OSPFS_NDIRECT){
+		free_block(oi->oi_direct[n]);
+		oi->oi_direct[n] = 0;
+	}
+
+	else if (n < OSPFS_NDIRECT + OSPFS_NINDIRECT){
+		uint32_t* indir_ptr = ospfs_block(oi->oi_indirect);
+
+		free_block(indir_ptr[direct_index(n)]);
+		indir_ptr[direct_index(n)] = 0;
+
+		if (direct_index(n) == 0){
+			free_block(oi->oi_indirect);
+			oi->oi_indirect = 0;
+		}
+	}
+
+	else if (n < OSPFS_MAXFILEBLKS){
+		uint32_t* indir2_ptr = ospfs_block(oi->oi_indirect2);
+		uint32_t* indir_ptr = ospfs_block(indir2_ptr[indir_index(n)]);
+		free_block(indir_ptr[direct_index(n)]);
+		indir_ptr[direct_index(n)] = 0;
+
+		if(direct_index(n) == 0){
+			free_block(indir2_ptr[indir_index(n)]);
+			indir2_ptr[indir_index(n)] = 0;
+		}
+		if (indir_index(n) == 0){
+			free_block(oi->oi_indirect2);
+			oi->oi_indirect2 = 0;
+		}
+	}
+	else
+		return -EIO;
+
+	oi->oi_size -= OSPFS_BLKSIZE;
+	return 0;
 }
 
 
@@ -792,16 +953,26 @@ change_size(ospfs_inode_t *oi, uint32_t new_size)
 
 	while (ospfs_size2nblocks(oi->oi_size) < ospfs_size2nblocks(new_size)) {
 	        /* EXERCISE: Your code here */
-		return -EIO; // Replace this line
+		r = add_block(oi);
+		if (r == -EIO)
+			return -EIO;
+		else if (r == -ENOSPC){
+			while (ospfs_size2nblocks(oi->oi_size) > ospfs_size2nblocks(new_size)) {
+	        	r = remove_block(oi);
+			}
+			oi->oi_size = old_size;
+			return -ENOSPC;
+		}
 	}
+	
 	while (ospfs_size2nblocks(oi->oi_size) > ospfs_size2nblocks(new_size)) {
-	        /* EXERCISE: Your code here */
-		return -EIO; // Replace this line
+		r = remove_block(oi);
+		if (r < 0)
+			return r;
 	}
+	oi->oi_size = new_size;
+	return 0;
 
-	/* EXERCISE: Make sure you update necessary file meta data
-	             and return the proper value. */
-	return -EIO; // Replace this line
 }
 
 
@@ -868,6 +1039,9 @@ ospfs_read(struct file *filp, char __user *buffer, size_t count, loff_t *f_pos)
 	// Change 'count' so we never read past the end of the file.
 	/* EXERCISE: Your code here */
 
+	if(count > oi->oi_size - *f_pos)
+		count = oi->oi_size - *f_pos;
+
 	// Copy the data to user block by block
 	while (amount < count && retval >= 0) {
 		uint32_t blockno = ospfs_inode_blockno(oi, *f_pos);
@@ -887,8 +1061,18 @@ ospfs_read(struct file *filp, char __user *buffer, size_t count, loff_t *f_pos)
 		// into user space.
 		// Use variable 'n' to track number of bytes moved.
 		/* EXERCISE: Your code here */
-		retval = -EIO; // Replace these lines
-		goto done;
+		n = count - amount;
+		uint32_t offset = *f_pos % OSPFS_BLKSIZE; 
+		if(count - amount > OSPFS_BLKSIZE - offset){
+			n = OSPFS_BLKSIZE - offset;
+		}
+		
+
+		retval = copy_to_user(buffer, data, n);
+		if (retval < 0){
+			retval = -EFAULT;
+			goto done;
+		}
 
 		buffer += n;
 		amount += n;
@@ -927,10 +1111,18 @@ ospfs_write(struct file *filp, const char __user *buffer, size_t count, loff_t *
 	// Support files opened with the O_APPEND flag.  To detect O_APPEND,
 	// use struct file's f_flags field and the O_APPEND bit.
 	/* EXERCISE: Your code here */
+	if(filp->f_flags & O_APPEND)
+		*f_pos = oi->oi_size;
 
 	// If the user is writing past the end of the file, change the file's
 	// size to accomodate the request.  (Use change_size().)
 	/* EXERCISE: Your code here */
+	if(count > oi->oi_size - *f_pos)
+		retval = change_size(oi, count + *f_pos);
+
+	if(retval < 0){
+		return retval;
+	}
 
 	// Copy data block by block
 	while (amount < count && retval >= 0) {
@@ -950,6 +1142,20 @@ ospfs_write(struct file *filp, const char __user *buffer, size_t count, loff_t *
 		// read user space.
 		// Keep track of the number of bytes moved in 'n'.
 		/* EXERCISE: Your code here */
+		n = count - amount;
+		uint32_t offset = *f_pos % OSPFS_BLKSIZE; 
+		if(count - amount > OSPFS_BLKSIZE - offset){
+			n = OSPFS_BLKSIZE - offset;
+		}
+
+		retval = copy_from_user(data+offset, buffer, n);
+		if (retval < 0){
+			retval = -EFAULT;
+			goto done;
+		}
+
+
+
 		retval = -EIO; // Replace these lines
 		goto done;
 
