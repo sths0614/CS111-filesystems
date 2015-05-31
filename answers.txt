@@ -11,14 +11,14 @@
 # information you'd like us to know, please add it at the end of the file.
 
 # Partner 1
-Name: 
-Student ID: 
-Email: 
+Name: Aditya Padmakumar
+Student ID: 204310314
+Email: aditya2506@ucla.edu
 
 # Partner 2 (if you're working in a team)
-Name: 
-Student ID: 
-Email: 
+Name: Stanley Hsu
+Student ID: 704338787
+Email: sths0614@ucla.edu
 
 # Extra credit problems
 #Extra credit problem: none
